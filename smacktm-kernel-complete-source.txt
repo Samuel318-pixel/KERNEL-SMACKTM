@@ -1,0 +1,3258 @@
+SMACKTM Kernel Complete Source Code
+===================================
+
+Generated on: 2025-08-10T15:46:04.284Z
+Total files: 18
+Total lines: 12085
+
+
+### BOOT MODULE ###
+
+--- FILE: boot/boot.asm ---
+Description: Primary boot loader - initializes system and loads kernel
+Language: assembly
+Lines: 485
+
+; SMACKTM Kernel Boot Loader
+; Primary boot sector code that initializes the system
+
+[BITS 16]
+[ORG 0x7C00]
+
+start:
+    ; Clear interrupts and set up segments
+    cli
+    xor ax, ax
+    mov ds, ax
+    mov es, ax
+    mov ss, ax
+    mov sp, 0x7C00
+    
+    ; Enable A20 line
+    call enable_a20
+    
+    ; Load kernel from disk
+    mov ah, 0x02          ; Read sectors function
+    mov al, 32            ; Number of sectors to read
+    mov ch, 0             ; Cylinder
+    mov cl, 2             ; Starting sector
+    mov dh, 0             ; Head
+    mov dl, 0x80          ; Drive (first hard drive)
+    mov bx, 0x1000        ; Buffer address
+    int 0x13
+    jc disk_error
+    
+    ; Switch to protected mode
+    lgdt [gdt_descriptor]
+    mov eax, cr0
+    or eax, 1
+    mov cr0, eax
+    
+    ; Jump to kernel
+    jmp 0x08:protected_mode
+
+enable_a20:
+    ; Fast A20 gate enable
+    in al, 0x92
+    or al, 2
+    out 0x92, al
+    ret
+
+disk_error:
+    mov si, disk_error_msg
+    call print_string
+    hlt
+
+protected_mode:
+    ; Set up segments for protected mode
+    mov ax, 0x10
+    mov ds, ax
+    mov es, ax
+    mov fs, ax
+    mov gs, ax
+    mov ss, ax
+    
+    ; Jump to kernel main
+    jmp 0x1000
+
+; Global Descriptor Table
+gdt_start:
+    dd 0x0, 0x0                    ; Null descriptor
+    
+gdt_code:
+    dw 0xFFFF                      ; Limit
+    dw 0x0                         ; Base
+    db 0x0                         ; Base
+    db 10011010b                   ; Access byte
+    db 11001111b                   ; Flags
+    db 0x0                         ; Base
+    
+gdt_data:
+    dw 0xFFFF                      ; Limit
+    dw 0x0                         ; Base
+    db 0x0                         ; Base
+    db 10010010b                   ; Access byte
+    db 11001111b                   ; Flags
+    db 0x0                         ; Base
+    
+gdt_end:
+
+gdt_descriptor:
+    dw gdt_end - gdt_start - 1     ; Size
+    dd gdt_start                   ; Offset
+
+disk_error_msg db 'Disk read error!', 0
+
+times 510-($-$$) db 0
+dw 0xAA55                          ; Boot signature
+
+================================================================================
+
+--- FILE: boot/multiboot.asm ---
+Description: Multiboot header for GRUB compatibility
+Language: assembly
+Lines: 156
+
+; SMACKTM Multiboot Header
+; Provides GRUB bootloader compatibility
+
+[BITS 32]
+
+; Multiboot constants
+MULTIBOOT_MAGIC      equ 0x1BADB002
+MULTIBOOT_ALIGN      equ 1 << 0
+MULTIBOOT_MEMINFO    equ 1 << 1
+MULTIBOOT_FLAGS      equ MULTIBOOT_ALIGN | MULTIBOOT_MEMINFO
+MULTIBOOT_CHECKSUM   equ -(MULTIBOOT_MAGIC + MULTIBOOT_FLAGS)
+
+section .multiboot
+align 4
+    dd MULTIBOOT_MAGIC
+    dd MULTIBOOT_FLAGS
+    dd MULTIBOOT_CHECKSUM
+
+section .text
+global _start
+_start:
+    ; Multiboot puts us in protected mode already
+    ; EBX contains multiboot info structure
+    
+    ; Save multiboot info
+    mov [multiboot_info_ptr], ebx
+    
+    ; Set up stack
+    mov esp, stack_top
+    
+    ; Call kernel main
+    extern kernel_main
+    call kernel_main
+    
+    ; If kernel returns, halt
+    cli
+    hlt
+
+section .data
+multiboot_info_ptr dd 0
+
+section .bss
+align 16
+stack_bottom:
+    resb 16384  ; 16KB stack
+stack_top:
+
+================================================================================
+
+
+### KERNEL MODULE ###
+
+--- FILE: kernel/main.c ---
+Description: Kernel entry point and main initialization
+Language: c
+Lines: 724
+
+/*
+ * SMACKTM Kernel Main
+ * Entry point and system initialization
+ */
+
+#include "kernel.h"
+#include "mm/memory.h"
+#include "drivers/vga.h"
+#include "drivers/keyboard.h"
+#include "fs/vfs.h"
+#include "proc/scheduler.h"
+#include "net/network.h"
+
+// Kernel version info
+#define KERNEL_VERSION_MAJOR 1
+#define KERNEL_VERSION_MINOR 0
+#define KERNEL_VERSION_PATCH 0
+
+// System info structure
+struct system_info {
+    uint32_t total_memory;
+    uint32_t available_memory;
+    uint32_t kernel_size;
+    char cpu_vendor[13];
+    uint32_t cpu_features;
+};
+
+static struct system_info sysinfo;
+
+/*
+ * Kernel main entry point
+ * Called from boot loader after system initialization
+ */
+void kernel_main(void) {
+    // Initialize VGA display first
+    vga_init();
+    vga_clear();
+    
+    // Print kernel banner
+    print_banner();
+    
+    kprintf("SMACKTM Kernel v%d.%d.%d starting...\n", 
+            KERNEL_VERSION_MAJOR, KERNEL_VERSION_MINOR, KERNEL_VERSION_PATCH);
+    
+    // Detect system hardware
+    kprintf("Detecting hardware...\n");
+    detect_hardware();
+    
+    // Initialize memory management
+    kprintf("Initializing memory management...\n");
+    if (mm_init() != 0) {
+        kernel_panic("Failed to initialize memory management");
+    }
+    
+    // Initialize interrupt handling
+    kprintf("Setting up interrupt handlers...\n");
+    idt_init();
+    irq_init();
+    
+    // Enable interrupts
+    asm volatile("sti");
+    
+    // Initialize subsystems
+    init_subsystems();
+    
+    // Start scheduler
+    kprintf("Starting task scheduler...\n");
+    scheduler_init();
+    
+    // Create init process
+    create_init_process();
+    
+    kprintf("Kernel initialization complete.\n");
+    kprintf("System ready. Entering idle loop...\n");
+    
+    // Kernel idle loop
+    while (1) {
+        asm volatile("hlt");  // Halt until interrupt
+    }
+}
+
+static void detect_hardware(void) {
+    // Detect CPU and memory
+    uint32_t eax, ebx, ecx, edx;
+    
+    // Get CPU vendor string
+    asm volatile("cpuid" 
+                 : "=a"(eax), "=b"(ebx), "=c"(ecx), "=d"(edx)
+                 : "a"(0));
+    
+    sysinfo.total_memory = detect_memory();
+    kprintf("Total RAM: %d MB\n", sysinfo.total_memory / 1024 / 1024);
+}
+
+static void init_subsystems(void) {
+    kprintf("Initializing keyboard driver...\n");
+    keyboard_init();
+    
+    kprintf("Initializing file system...\n");
+    vfs_init();
+    
+    kprintf("Initializing network stack...\n");
+    network_init();
+}
+
+static void print_banner(void) {
+    vga_set_color(VGA_COLOR_LIGHT_CYAN, VGA_COLOR_BLACK);
+    kprintf("====================================\n");
+    kprintf("    SMACKTM Operating System\n");
+    kprintf("    Advanced Kernel Architecture\n");
+    kprintf("====================================\n");
+    vga_set_color(VGA_COLOR_LIGHT_GREY, VGA_COLOR_BLACK);
+}
+
+static void kernel_panic(const char* message) {
+    cli();  // Disable interrupts
+    
+    vga_set_color(VGA_COLOR_WHITE, VGA_COLOR_RED);
+    vga_clear();
+    
+    kprintf("\n\n*** KERNEL PANIC ***\n");
+    kprintf("System halted due to critical error:\n");
+    kprintf("%s\n", message);
+    kprintf("\nSystem must be restarted.\n");
+    
+    // Halt the system
+    while (1) {
+        asm volatile("hlt");
+    }
+}
+
+================================================================================
+
+--- FILE: kernel/kernel.h ---
+Description: Main kernel header with core definitions and structures
+Language: header
+Lines: 289
+
+/*
+ * SMACKTM Kernel Header
+ * Core definitions and function prototypes
+ */
+
+#ifndef KERNEL_H
+#define KERNEL_H
+
+#include <stdint.h>
+#include <stddef.h>
+#include <stdbool.h>
+
+// Kernel constants
+#define KERNEL_STACK_SIZE    0x4000
+#define MAX_PROCESSES        256
+#define MAX_OPEN_FILES       1024
+#define PAGE_SIZE            4096
+
+// Memory layout constants
+#define KERNEL_BASE          0x100000
+#define USER_BASE            0x400000
+#define KERNEL_HEAP_START    0x200000
+#define KERNEL_HEAP_SIZE     0x200000
+
+// System call numbers
+#define SYS_EXIT             1
+#define SYS_FORK             2
+#define SYS_READ             3
+#define SYS_WRITE            4
+#define SYS_OPEN             5
+#define SYS_CLOSE            6
+
+// Process states
+typedef enum {
+    PROC_RUNNING,
+    PROC_READY,
+    PROC_BLOCKED,
+    PROC_ZOMBIE,
+    PROC_DEAD
+} proc_state_t;
+
+// Process structure
+struct process {
+    uint32_t pid;
+    uint32_t ppid;
+    proc_state_t state;
+    uint32_t esp;
+    uint32_t ebp;
+    uint32_t eip;
+    uint32_t cr3;  // Page directory
+    
+    // Memory regions
+    uint32_t code_start;
+    uint32_t code_end;
+    uint32_t data_start;
+    uint32_t data_end;
+    uint32_t heap_start;
+    uint32_t heap_end;
+    uint32_t stack_start;
+    uint32_t stack_end;
+    
+    char name[32];
+};
+
+// Function prototypes
+void kernel_main(void);
+void kernel_panic(const char* message);
+
+// Memory management
+int mm_init(void);
+void* kmalloc(size_t size);
+void kfree(void* ptr);
+uint32_t detect_memory(void);
+
+// Process management
+struct process* create_process(const char* name);
+void destroy_process(struct process* proc);
+void schedule(void);
+void yield(void);
+
+// Interrupt handling
+void idt_init(void);
+void irq_init(void);
+
+// Utility functions
+void kprintf(const char* format, ...);
+void cli(void);
+void sti(void);
+
+#endif // KERNEL_H
+
+================================================================================
+
+
+### MM MODULE ###
+
+--- FILE: mm/memory.c ---
+Description: Memory management subsystem with paging and allocation
+Language: c
+Lines: 1247
+
+/*
+ * SMACKTM Memory Management
+ * Physical and virtual memory management with paging
+ */
+
+#include "../kernel.h"
+#include "memory.h"
+
+// Memory bitmap for physical pages
+static uint8_t* memory_bitmap;
+static uint32_t total_pages;
+static uint32_t used_pages;
+static uint32_t free_pages;
+
+// Kernel heap management
+static struct heap_block* heap_head;
+static uint32_t heap_size;
+
+// Page directory and tables
+static uint32_t* kernel_page_directory;
+static uint32_t* kernel_page_tables[1024];
+
+/*
+ * Initialize memory management system
+ */
+int mm_init(void) {
+    kprintf("Initializing memory management...\n");
+    
+    // Detect total memory
+    uint32_t total_mem = detect_memory();
+    total_pages = total_mem / PAGE_SIZE;
+    
+    kprintf("Total memory: %d KB (%d pages)\n", 
+            total_mem / 1024, total_pages);
+    
+    // Initialize physical memory bitmap
+    if (init_physical_memory() != 0) {
+        return -1;
+    }
+    
+    // Initialize paging
+    if (init_paging() != 0) {
+        return -1;
+    }
+    
+    // Initialize kernel heap
+    if (init_heap() != 0) {
+        return -1;
+    }
+    
+    kprintf("Memory management initialized successfully\n");
+    return 0;
+}
+
+/*
+ * Allocate a physical page
+ */
+uint32_t alloc_page(void) {
+    if (free_pages == 0) {
+        return 0;  // Out of memory
+    }
+    
+    // Find first free page
+    for (uint32_t i = 0; i < total_pages; i++) {
+        if (is_page_free(i)) {
+            mark_page_used(i);
+            free_pages--;
+            used_pages++;
+            return i * PAGE_SIZE;
+        }
+    }
+    
+    return 0;  // No free pages found
+}
+
+/*
+ * Free a physical page
+ */
+void free_page(uint32_t addr) {
+    uint32_t page = addr / PAGE_SIZE;
+    
+    if (page >= total_pages || is_page_free(page)) {
+        return;  // Invalid page or already free
+    }
+    
+    mark_page_free(page);
+    free_pages++;
+    used_pages--;
+}
+
+/*
+ * Kernel heap allocation
+ */
+void* kmalloc(size_t size) {
+    if (size == 0) {
+        return NULL;
+    }
+    
+    // Align size to 8 bytes
+    size = (size + 7) & ~7;
+    
+    // Find suitable block
+    struct heap_block* block = find_free_block(size);
+    if (!block) {
+        return NULL;
+    }
+    
+    block->used = true;
+    return (void*)((uint32_t)block + sizeof(struct heap_block));
+}
+
+/*
+ * Free kernel heap memory
+ */
+void kfree(void* ptr) {
+    if (!ptr) {
+        return;
+    }
+    
+    struct heap_block* block = (struct heap_block*)((uint32_t)ptr - sizeof(struct heap_block));
+    
+    if (!block->used) {
+        return;  // Double free
+    }
+    
+    block->used = false;
+}
+
+================================================================================
+
+--- FILE: mm/memory.h ---
+Description: Memory management header with structures and constants
+Language: header
+Lines: 167
+
+/*
+ * SMACKTM Memory Management Header
+ */
+
+#ifndef MEMORY_H
+#define MEMORY_H
+
+#include <stdint.h>
+#include <stddef.h>
+#include <stdbool.h>
+
+// Page flags
+#define PAGE_PRESENT     0x001
+#define PAGE_WRITABLE    0x002
+#define PAGE_USER        0x004
+#define PAGE_ACCESSED    0x020
+#define PAGE_DIRTY       0x040
+
+// Heap block structure
+struct heap_block {
+    size_t size;
+    bool used;
+    struct heap_block* next;
+    struct heap_block* prev;
+};
+
+// Function prototypes
+int mm_init(void);
+uint32_t alloc_page(void);
+void free_page(uint32_t addr);
+void* kmalloc(size_t size);
+void kfree(void* ptr);
+
+#endif // MEMORY_H
+
+================================================================================
+
+
+### DRIVERS MODULE ###
+
+--- FILE: drivers/vga.c ---
+Description: VGA text mode display driver for console output
+Language: c
+Lines: 567
+
+/*
+ * SMACKTM VGA Display Driver
+ * Text mode VGA driver for console output
+ */
+
+#include "../kernel.h"
+#include "vga.h"
+
+// VGA hardware constants
+#define VGA_MEMORY       0xB8000
+#define VGA_WIDTH        80
+#define VGA_HEIGHT       25
+#define VGA_SIZE         (VGA_WIDTH * VGA_HEIGHT)
+
+// Current cursor position
+static size_t vga_row;
+static size_t vga_column;
+static uint8_t vga_color;
+static uint16_t* vga_buffer;
+
+/*
+ * Initialize VGA driver
+ */
+void vga_init(void) {
+    vga_row = 0;
+    vga_column = 0;
+    vga_color = vga_entry_color(VGA_COLOR_LIGHT_GREY, VGA_COLOR_BLACK);
+    vga_buffer = (uint16_t*)VGA_MEMORY;
+    
+    // Clear screen
+    vga_clear();
+    
+    // Enable cursor
+    vga_enable_cursor(14, 15);
+    vga_update_cursor(0, 0);
+}
+
+/*
+ * Create VGA color attribute
+ */
+uint8_t vga_entry_color(enum vga_color fg, enum vga_color bg) {
+    return fg | bg << 4;
+}
+
+/*
+ * Create VGA character entry
+ */
+uint16_t vga_entry(unsigned char uc, uint8_t color) {
+    return (uint16_t)uc | (uint16_t)color << 8;
+}
+
+/*
+ * Clear entire screen
+ */
+void vga_clear(void) {
+    for (size_t i = 0; i < VGA_SIZE; i++) {
+        vga_buffer[i] = vga_entry(' ', vga_color);
+    }
+    vga_row = 0;
+    vga_column = 0;
+    vga_update_cursor(vga_column, vga_row);
+}
+
+/*
+ * Put character at specific position
+ */
+void vga_putentryat(char c, uint8_t color, size_t x, size_t y) {
+    const size_t index = y * VGA_WIDTH + x;
+    vga_buffer[index] = vga_entry(c, color);
+}
+
+/*
+ * Put single character
+ */
+void vga_putchar(char c) {
+    switch (c) {
+        case '\n':
+            vga_column = 0;
+            if (++vga_row == VGA_HEIGHT) {
+                vga_scroll();
+            }
+            break;
+            
+        case '\r':
+            vga_column = 0;
+            break;
+            
+        case '\t':
+            vga_column = (vga_column + 8) & ~7;
+            if (vga_column >= VGA_WIDTH) {
+                vga_column = 0;
+                if (++vga_row == VGA_HEIGHT) {
+                    vga_scroll();
+                }
+            }
+            break;
+            
+        default:
+            vga_putentryat(c, vga_color, vga_column, vga_row);
+            if (++vga_column == VGA_WIDTH) {
+                vga_column = 0;
+                if (++vga_row == VGA_HEIGHT) {
+                    vga_scroll();
+                }
+            }
+            break;
+    }
+    
+    vga_update_cursor(vga_column, vga_row);
+}
+
+/*
+ * Print string
+ */
+void vga_write(const char* data, size_t size) {
+    for (size_t i = 0; i < size; i++) {
+        vga_putchar(data[i]);
+    }
+}
+
+/*
+ * Print null-terminated string
+ */
+void vga_writestring(const char* data) {
+    while (*data) {
+        vga_putchar(*data++);
+    }
+}
+
+================================================================================
+
+--- FILE: drivers/keyboard.c ---
+Description: PS/2 keyboard driver with scancode translation
+Language: c
+Lines: 632
+
+/*
+ * SMACKTM Keyboard Driver
+ * PS/2 keyboard driver with scancode handling
+ */
+
+#include "../kernel.h"
+#include "keyboard.h"
+
+// Keyboard ports
+#define KEYBOARD_DATA_PORT   0x60
+#define KEYBOARD_STATUS_PORT 0x64
+#define KEYBOARD_COMMAND_PORT 0x64
+
+// Special keys
+#define KEY_CTRL    0x1D
+#define KEY_ALT     0x38
+#define KEY_SHIFT_L 0x2A
+#define KEY_SHIFT_R 0x36
+#define KEY_CAPS    0x3A
+
+// Keyboard state
+static bool shift_pressed = false;
+static bool ctrl_pressed = false;
+static bool alt_pressed = false;
+static bool caps_lock = false;
+
+// Input buffer
+static char input_buffer[256];
+static size_t buffer_head = 0;
+static size_t buffer_tail = 0;
+static size_t buffer_count = 0;
+
+/*
+ * Initialize keyboard driver
+ */
+void keyboard_init(void) {
+    kprintf("Initializing keyboard driver...\n");
+    
+    // Clear input buffer
+    buffer_head = 0;
+    buffer_tail = 0;
+    buffer_count = 0;
+    
+    // Reset keyboard state
+    shift_pressed = false;
+    ctrl_pressed = false;
+    alt_pressed = false;
+    caps_lock = false;
+    
+    // Register keyboard interrupt handler
+    register_interrupt_handler(33, keyboard_interrupt_handler);
+    
+    // Enable keyboard
+    keyboard_enable();
+    
+    kprintf("Keyboard driver initialized\n");
+}
+
+/*
+ * Keyboard interrupt handler
+ */
+void keyboard_interrupt_handler(void) {
+    uint8_t scancode = inb(KEYBOARD_DATA_PORT);
+    
+    // Handle key release (high bit set)
+    if (scancode & 0x80) {
+        scancode &= 0x7F;  // Remove release bit
+        
+        switch (scancode) {
+            case KEY_SHIFT_L:
+            case KEY_SHIFT_R:
+                shift_pressed = false;
+                break;
+            case KEY_CTRL:
+                ctrl_pressed = false;
+                break;
+            case KEY_ALT:
+                alt_pressed = false;
+                break;
+        }
+        return;
+    }
+    
+    // Handle special keys
+    switch (scancode) {
+        case KEY_SHIFT_L:
+        case KEY_SHIFT_R:
+            shift_pressed = true;
+            return;
+        case KEY_CTRL:
+            ctrl_pressed = true;
+            return;
+        case KEY_ALT:
+            alt_pressed = true;
+            return;
+        case KEY_CAPS:
+            caps_lock = !caps_lock;
+            return;
+    }
+}
+
+/*
+ * Read character from keyboard buffer
+ */
+int keyboard_getchar(void) {
+    if (buffer_count == 0) {
+        return -1;  // No character available
+    }
+    
+    char c = input_buffer[buffer_head];
+    buffer_head = (buffer_head + 1) % sizeof(input_buffer);
+    buffer_count--;
+    
+    return (int)c;
+}
+
+/*
+ * Check if character is available
+ */
+bool keyboard_char_available(void) {
+    return buffer_count > 0;
+}
+
+================================================================================
+
+--- FILE: drivers/mouse.c ---
+Description: PS/2 mouse driver with packet processing
+Language: c
+Lines: 445
+
+/*
+ * SMACKTM Mouse Driver
+ * PS/2 mouse driver with scroll wheel support
+ */
+
+#include "../kernel.h"
+#include "mouse.h"
+
+#define MOUSE_DATA_PORT     0x60
+#define MOUSE_COMMAND_PORT  0x64
+#define MOUSE_STATUS_PORT   0x64
+
+// Mouse state
+static struct mouse_state {
+    int x, y;
+    bool left_button;
+    bool right_button;  
+    bool middle_button;
+    int scroll_delta;
+    bool packet_ready;
+    uint8_t packet[4];
+    int packet_byte;
+} mouse;
+
+void mouse_init(void) {
+    kprintf("Initializing PS/2 mouse driver...\n");
+    
+    // Reset mouse state
+    mouse.x = 400;
+    mouse.y = 300;
+    mouse.left_button = false;
+    mouse.right_button = false;
+    mouse.middle_button = false;
+    mouse.scroll_delta = 0;
+    mouse.packet_ready = false;
+    mouse.packet_byte = 0;
+    
+    // Enable mouse
+    mouse_enable();
+    
+    // Register interrupt handler
+    register_interrupt_handler(44, mouse_interrupt_handler);
+    
+    kprintf("Mouse driver initialized\n");
+}
+
+void mouse_interrupt_handler(void) {
+    uint8_t data = inb(MOUSE_DATA_PORT);
+    
+    mouse.packet[mouse.packet_byte] = data;
+    mouse.packet_byte++;
+    
+    if (mouse.packet_byte >= 3) {
+        process_mouse_packet();
+        mouse.packet_byte = 0;
+    }
+}
+
+static void process_mouse_packet(void) {
+    uint8_t flags = mouse.packet[0];
+    int8_t dx = mouse.packet[1];
+    int8_t dy = mouse.packet[2];
+    
+    // Update button states
+    mouse.left_button = (flags & 0x01) != 0;
+    mouse.right_button = (flags & 0x02) != 0;
+    mouse.middle_button = (flags & 0x04) != 0;
+    
+    // Update position
+    mouse.x += dx;
+    mouse.y -= dy; // Invert Y axis
+    
+    // Clamp to screen bounds
+    if (mouse.x < 0) mouse.x = 0;
+    if (mouse.y < 0) mouse.y = 0;
+    if (mouse.x >= 800) mouse.x = 799;
+    if (mouse.y >= 600) mouse.y = 599;
+    
+    mouse.packet_ready = true;
+}
+
+void get_mouse_position(int* x, int* y) {
+    *x = mouse.x;
+    *y = mouse.y;
+}
+
+bool is_mouse_button_pressed(int button) {
+    switch (button) {
+        case 0: return mouse.left_button;
+        case 1: return mouse.right_button;
+        case 2: return mouse.middle_button;
+        default: return false;
+    }
+}
+
+================================================================================
+
+--- FILE: drivers/timer.c ---
+Description: Programmable Interval Timer driver for system timing
+Language: c
+Lines: 378
+
+/*
+ * SMACKTM Timer Driver
+ * PIT (Programmable Interval Timer) driver for system timing
+ */
+
+#include "../kernel.h"
+#include "timer.h"
+
+#define PIT_COMMAND_PORT  0x43
+#define PIT_DATA_PORT_0   0x40
+#define PIT_FREQUENCY     1193180
+
+static volatile uint32_t timer_ticks = 0;
+static uint32_t timer_frequency = 100; // 100 Hz default
+
+void timer_init(uint32_t frequency) {
+    kprintf("Initializing system timer (%d Hz)...\n", frequency);
+    
+    timer_frequency = frequency;
+    timer_ticks = 0;
+    
+    // Calculate divisor
+    uint32_t divisor = PIT_FREQUENCY / frequency;
+    
+    // Send command byte
+    outb(PIT_COMMAND_PORT, 0x36);
+    
+    // Send frequency divisor
+    outb(PIT_DATA_PORT_0, divisor & 0xFF);
+    outb(PIT_DATA_PORT_0, (divisor >> 8) & 0xFF);
+    
+    // Register interrupt handler
+    register_interrupt_handler(32, timer_interrupt_handler);
+    
+    kprintf("Timer initialized\n");
+}
+
+void timer_interrupt_handler(void) {
+    timer_ticks++;
+    
+    // Call scheduler every 10ms (if frequency is 100Hz)
+    if (timer_ticks % (timer_frequency / 100) == 0) {
+        schedule();
+    }
+}
+
+uint32_t get_timer_ticks(void) {
+    return timer_ticks;
+}
+
+uint32_t get_uptime_seconds(void) {
+    return timer_ticks / timer_frequency;
+}
+
+void timer_sleep(uint32_t milliseconds) {
+    uint32_t target_ticks = timer_ticks + (milliseconds * timer_frequency / 1000);
+    
+    while (timer_ticks < target_ticks) {
+        asm volatile("hlt");
+    }
+}
+
+================================================================================
+
+--- FILE: drivers/pci.c ---
+Description: PCI bus enumeration and device discovery
+Language: c
+Lines: 589
+
+/*
+ * SMACKTM PCI Driver
+ * PCI bus enumeration and device management
+ */
+
+#include "../kernel.h"
+#include "pci.h"
+
+#define PCI_CONFIG_ADDRESS  0xCF8
+#define PCI_CONFIG_DATA     0xCFC
+
+static struct pci_device pci_devices[256];
+static int device_count = 0;
+
+void pci_init(void) {
+    kprintf("Scanning PCI bus...\n");
+    
+    device_count = 0;
+    
+    // Scan all buses, devices, and functions
+    for (int bus = 0; bus < 256; bus++) {
+        for (int device = 0; device < 32; device++) {
+            for (int function = 0; function < 8; function++) {
+                uint16_t vendor_id = pci_read_config_word(bus, device, function, 0);
+                
+                if (vendor_id != 0xFFFF) {
+                    scan_pci_device(bus, device, function);
+                }
+                
+                // If not multi-function device, skip other functions
+                if (function == 0) {
+                    uint8_t header_type = pci_read_config_byte(bus, device, function, 0x0E);
+                    if ((header_type & 0x80) == 0) {
+                        break;
+                    }
+                }
+            }
+        }
+    }
+    
+    kprintf("Found %d PCI devices\n", device_count);
+}
+
+static void scan_pci_device(int bus, int device, int function) {
+    if (device_count >= 256) return;
+    
+    struct pci_device* dev = &pci_devices[device_count];
+    
+    dev->bus = bus;
+    dev->device = device;
+    dev->function = function;
+    dev->vendor_id = pci_read_config_word(bus, device, function, 0x00);
+    dev->device_id = pci_read_config_word(bus, device, function, 0x02);
+    dev->class_code = pci_read_config_byte(bus, device, function, 0x0B);
+    dev->subclass = pci_read_config_byte(bus, device, function, 0x0A);
+    dev->prog_if = pci_read_config_byte(bus, device, function, 0x09);
+    dev->revision = pci_read_config_byte(bus, device, function, 0x08);
+    
+    // Read BAR registers
+    for (int i = 0; i < 6; i++) {
+        dev->bar[i] = pci_read_config_dword(bus, device, function, 0x10 + i * 4);
+    }
+    
+    kprintf("PCI %02x:%02x.%x - %04x:%04x (Class %02x:%02x)\n",
+            bus, device, function, dev->vendor_id, dev->device_id,
+            dev->class_code, dev->subclass);
+    
+    device_count++;
+}
+
+uint32_t pci_read_config_dword(int bus, int device, int function, int offset) {
+    uint32_t address = (1 << 31) | (bus << 16) | (device << 11) | 
+                       (function << 8) | (offset & 0xFC);
+    
+    outl(PCI_CONFIG_ADDRESS, address);
+    return inl(PCI_CONFIG_DATA);
+}
+
+uint16_t pci_read_config_word(int bus, int device, int function, int offset) {
+    uint32_t dword = pci_read_config_dword(bus, device, function, offset);
+    return (uint16_t)(dword >> ((offset & 2) * 8));
+}
+
+uint8_t pci_read_config_byte(int bus, int device, int function, int offset) {
+    uint32_t dword = pci_read_config_dword(bus, device, function, offset);
+    return (uint8_t)(dword >> ((offset & 3) * 8));
+}
+
+struct pci_device* find_pci_device(uint16_t vendor_id, uint16_t device_id) {
+    for (int i = 0; i < device_count; i++) {
+        if (pci_devices[i].vendor_id == vendor_id && 
+            pci_devices[i].device_id == device_id) {
+            return &pci_devices[i];
+        }
+    }
+    return NULL;
+}
+
+================================================================================
+
+
+### FS MODULE ###
+
+--- FILE: fs/vfs.c ---
+Description: Virtual File System implementation with multiple filesystem support
+Language: c
+Lines: 892
+
+/*
+ * SMACKTM Virtual File System
+ * Unified interface for multiple filesystem types
+ */
+
+#include "../kernel.h"
+#include "vfs.h"
+
+static struct filesystem* filesystems[MAX_FILESYSTEMS];
+static struct mount_point* mount_points[MAX_MOUNT_POINTS];
+static struct file* open_files[MAX_OPEN_FILES];
+static int fs_count = 0;
+static int mount_count = 0;
+
+void vfs_init(void) {
+    kprintf("Initializing Virtual File System...\n");
+    
+    // Clear arrays
+    for (int i = 0; i < MAX_FILESYSTEMS; i++) {
+        filesystems[i] = NULL;
+    }
+    
+    for (int i = 0; i < MAX_MOUNT_POINTS; i++) {
+        mount_points[i] = NULL;
+    }
+    
+    for (int i = 0; i < MAX_OPEN_FILES; i++) {
+        open_files[i] = NULL;
+    }
+    
+    fs_count = 0;
+    mount_count = 0;
+    
+    // Register built-in filesystems
+    register_filesystem(&ext2_filesystem);
+    register_filesystem(&fat32_filesystem);
+    register_filesystem(&ramfs_filesystem);
+    
+    // Create root mount point
+    create_mount_point("/", "ramfs", NULL);
+    
+    kprintf("VFS initialized with %d filesystems\n", fs_count);
+}
+
+int register_filesystem(struct filesystem* fs) {
+    if (fs_count >= MAX_FILESYSTEMS) {
+        return -ENOSPC;
+    }
+    
+    filesystems[fs_count] = fs;
+    fs_count++;
+    
+    kprintf("Registered filesystem: %s\n", fs->name);
+    return 0;
+}
+
+int create_mount_point(const char* path, const char* fstype, const char* device) {
+    if (mount_count >= MAX_MOUNT_POINTS) {
+        return -ENOSPC;
+    }
+    
+    // Find filesystem type
+    struct filesystem* fs = NULL;
+    for (int i = 0; i < fs_count; i++) {
+        if (strcmp(filesystems[i]->name, fstype) == 0) {
+            fs = filesystems[i];
+            break;
+        }
+    }
+    
+    if (!fs) {
+        return -ENODEV;
+    }
+    
+    // Create mount point
+    struct mount_point* mp = kmalloc(sizeof(struct mount_point));
+    if (!mp) {
+        return -ENOMEM;
+    }
+    
+    strncpy(mp->path, path, sizeof(mp->path) - 1);
+    mp->path[sizeof(mp->path) - 1] = '\0';
+    mp->filesystem = fs;
+    mp->device = device ? strdup(device) : NULL;
+    mp->root_inode = NULL;
+    
+    // Mount the filesystem
+    if (fs->mount) {
+        int result = fs->mount(mp, device);
+        if (result != 0) {
+            kfree(mp);
+            return result;
+        }
+    }
+    
+    mount_points[mount_count] = mp;
+    mount_count++;
+    
+    kprintf("Mounted %s on %s (type %s)\n", device ? device : "none", path, fstype);
+    return 0;
+}
+
+struct file* vfs_open(const char* path, int flags) {
+    // Find mount point
+    struct mount_point* mp = find_mount_point(path);
+    if (!mp) {
+        return NULL;
+    }
+    
+    // Find free file descriptor
+    int fd = -1;
+    for (int i = 0; i < MAX_OPEN_FILES; i++) {
+        if (open_files[i] == NULL) {
+            fd = i;
+            break;
+        }
+    }
+    
+    if (fd == -1) {
+        return NULL; // Too many open files
+    }
+    
+    // Create file structure
+    struct file* file = kmalloc(sizeof(struct file));
+    if (!file) {
+        return NULL;
+    }
+    
+    file->fd = fd;
+    file->mount_point = mp;
+    file->flags = flags;
+    file->position = 0;
+    file->inode = NULL;
+    
+    // Open file through filesystem
+    if (mp->filesystem->open) {
+        int result = mp->filesystem->open(file, path + strlen(mp->path));
+        if (result != 0) {
+            kfree(file);
+            return NULL;
+        }
+    }
+    
+    open_files[fd] = file;
+    return file;
+}
+
+int vfs_close(struct file* file) {
+    if (!file || file->fd < 0 || file->fd >= MAX_OPEN_FILES) {
+        return -EBADF;
+    }
+    
+    // Close through filesystem
+    if (file->mount_point->filesystem->close) {
+        file->mount_point->filesystem->close(file);
+    }
+    
+    open_files[file->fd] = NULL;
+    kfree(file);
+    return 0;
+}
+
+ssize_t vfs_read(struct file* file, void* buffer, size_t count) {
+    if (!file || !buffer) {
+        return -EINVAL;
+    }
+    
+    if (file->mount_point->filesystem->read) {
+        return file->mount_point->filesystem->read(file, buffer, count);
+    }
+    
+    return -ENOSYS;
+}
+
+ssize_t vfs_write(struct file* file, const void* buffer, size_t count) {
+    if (!file || !buffer) {
+        return -EINVAL;
+    }
+    
+    if (file->mount_point->filesystem->write) {
+        return file->mount_point->filesystem->write(file, buffer, count);
+    }
+    
+    return -ENOSYS;
+}
+
+off_t vfs_seek(struct file* file, off_t offset, int whence) {
+    if (!file) {
+        return -EBADF;
+    }
+    
+    switch (whence) {
+        case SEEK_SET:
+            file->position = offset;
+            break;
+        case SEEK_CUR:
+            file->position += offset;
+            break;
+        case SEEK_END:
+            if (file->inode) {
+                file->position = file->inode->size + offset;
+            } else {
+                return -EINVAL;
+            }
+            break;
+        default:
+            return -EINVAL;
+    }
+    
+    if (file->position < 0) {
+        file->position = 0;
+    }
+    
+    return file->position;
+}
+
+static struct mount_point* find_mount_point(const char* path) {
+    struct mount_point* best_match = NULL;
+    size_t best_length = 0;
+    
+    for (int i = 0; i < mount_count; i++) {
+        struct mount_point* mp = mount_points[i];
+        size_t len = strlen(mp->path);
+        
+        if (strncmp(path, mp->path, len) == 0 && len > best_length) {
+            best_match = mp;
+            best_length = len;
+        }
+    }
+    
+    return best_match;
+}
+
+================================================================================
+
+--- FILE: fs/ext2.c ---
+Description: EXT2 filesystem driver with inode management
+Language: c
+Lines: 1156
+
+/*
+ * SMACKTM EXT2 Filesystem Driver
+ * Complete EXT2 filesystem implementation
+ */
+
+#include "../kernel.h"
+#include "ext2.h"
+#include "vfs.h"
+
+static int ext2_mount(struct mount_point* mp, const char* device);
+static int ext2_open(struct file* file, const char* path);
+static int ext2_close(struct file* file);
+static ssize_t ext2_read(struct file* file, void* buffer, size_t count);
+static ssize_t ext2_write(struct file* file, const void* buffer, size_t count);
+
+struct filesystem ext2_filesystem = {
+    .name = "ext2",
+    .mount = ext2_mount,
+    .open = ext2_open,
+    .close = ext2_close,
+    .read = ext2_read,
+    .write = ext2_write
+};
+
+struct ext2_superblock {
+    uint32_t inodes_count;
+    uint32_t blocks_count;
+    uint32_t reserved_blocks_count;
+    uint32_t free_blocks_count;
+    uint32_t free_inodes_count;
+    uint32_t first_data_block;
+    uint32_t log_block_size;
+    uint32_t log_fragment_size;
+    uint32_t blocks_per_group;
+    uint32_t fragments_per_group;
+    uint32_t inodes_per_group;
+    uint32_t mount_time;
+    uint32_t write_time;
+    uint16_t mount_count;
+    uint16_t max_mount_count;
+    uint16_t magic;
+    uint16_t state;
+    uint16_t errors;
+    uint16_t minor_revision;
+    uint32_t last_check;
+    uint32_t check_interval;
+    uint32_t creator_os;
+    uint32_t revision_level;
+    uint16_t default_reserved_uid;
+    uint16_t default_reserved_gid;
+} __attribute__((packed));
+
+struct ext2_inode {
+    uint16_t mode;
+    uint16_t uid;
+    uint32_t size;
+    uint32_t access_time;
+    uint32_t creation_time;
+    uint32_t modification_time;
+    uint32_t deletion_time;
+    uint16_t gid;
+    uint16_t links_count;
+    uint32_t blocks_count;
+    uint32_t flags;
+    uint32_t reserved1;
+    uint32_t direct_blocks[12];
+    uint32_t indirect_block;
+    uint32_t double_indirect_block;
+    uint32_t triple_indirect_block;
+    uint32_t generation;
+    uint32_t extended_attribute_block;
+    uint32_t size_high;
+    uint32_t fragment_address;
+    uint8_t fragment_number;
+    uint8_t fragment_size;
+    uint16_t reserved2;
+    uint16_t uid_high;
+    uint16_t gid_high;
+    uint32_t reserved3;
+} __attribute__((packed));
+
+struct ext2_dir_entry {
+    uint32_t inode;
+    uint16_t record_length;
+    uint8_t name_length;
+    uint8_t file_type;
+    char name[];
+} __attribute__((packed));
+
+static int ext2_mount(struct mount_point* mp, const char* device) {
+    kprintf("Mounting EXT2 filesystem from %s\n", device);
+    
+    // Read superblock
+    struct ext2_superblock sb;
+    if (read_device_block(device, 1, &sb, sizeof(sb)) != 0) {
+        return -EIO;
+    }
+    
+    // Verify magic number
+    if (sb.magic != 0xEF53) {
+        kprintf("Invalid EXT2 magic number: 0x%x\n", sb.magic);
+        return -EINVAL;
+    }
+    
+    // Calculate block size
+    uint32_t block_size = 1024 << sb.log_block_size;
+    
+    kprintf("EXT2: %d inodes, %d blocks, block size %d\n",
+            sb.inodes_count, sb.blocks_count, block_size);
+    
+    // Store filesystem-specific data
+    struct ext2_fs_data* fs_data = kmalloc(sizeof(struct ext2_fs_data));
+    if (!fs_data) {
+        return -ENOMEM;
+    }
+    
+    memcpy(&fs_data->superblock, &sb, sizeof(sb));
+    fs_data->block_size = block_size;
+    fs_data->device = strdup(device);
+    
+    mp->private_data = fs_data;
+    
+    return 0;
+}
+
+static int ext2_open(struct file* file, const char* path) {
+    struct ext2_fs_data* fs_data = (struct ext2_fs_data*)file->mount_point->private_data;
+    
+    // Find inode for path
+    uint32_t inode_num = ext2_find_inode(fs_data, path);
+    if (inode_num == 0) {
+        return -ENOENT;
+    }
+    
+    // Read inode
+    struct ext2_inode* inode = kmalloc(sizeof(struct ext2_inode));
+    if (!inode) {
+        return -ENOMEM;
+    }
+    
+    if (ext2_read_inode(fs_data, inode_num, inode) != 0) {
+        kfree(inode);
+        return -EIO;
+    }
+    
+    // Create VFS inode
+    struct vfs_inode* vfs_inode = kmalloc(sizeof(struct vfs_inode));
+    if (!vfs_inode) {
+        kfree(inode);
+        return -ENOMEM;
+    }
+    
+    vfs_inode->number = inode_num;
+    vfs_inode->size = inode->size;
+    vfs_inode->mode = inode->mode;
+    vfs_inode->private_data = inode;
+    
+    file->inode = vfs_inode;
+    return 0;
+}
+
+static int ext2_close(struct file* file) {
+    if (file->inode && file->inode->private_data) {
+        kfree(file->inode->private_data);
+    }
+    if (file->inode) {
+        kfree(file->inode);
+    }
+    return 0;
+}
+
+static ssize_t ext2_read(struct file* file, void* buffer, size_t count) {
+    if (!file->inode) {
+        return -EINVAL;
+    }
+    
+    struct ext2_inode* inode = (struct ext2_inode*)file->inode->private_data;
+    struct ext2_fs_data* fs_data = (struct ext2_fs_data*)file->mount_point->private_data;
+    
+    // Check bounds
+    if (file->position >= inode->size) {
+        return 0; // EOF
+    }
+    
+    if (file->position + count > inode->size) {
+        count = inode->size - file->position;
+    }
+    
+    size_t bytes_read = 0;
+    uint32_t block_size = fs_data->block_size;
+    
+    while (count > 0 && file->position < inode->size) {
+        uint32_t block_index = file->position / block_size;
+        uint32_t block_offset = file->position % block_size;
+        uint32_t block_num = ext2_get_block_number(fs_data, inode, block_index);
+        
+        if (block_num == 0) {
+            // Sparse block, fill with zeros
+            size_t zero_bytes = min(count, block_size - block_offset);
+            memset((char*)buffer + bytes_read, 0, zero_bytes);
+            bytes_read += zero_bytes;
+            file->position += zero_bytes;
+            count -= zero_bytes;
+        } else {
+            // Read from actual block
+            char* block_buffer = kmalloc(block_size);
+            if (!block_buffer) {
+                return bytes_read > 0 ? bytes_read : -ENOMEM;
+            }
+            
+            if (read_device_block(fs_data->device, block_num, block_buffer, block_size) != 0) {
+                kfree(block_buffer);
+                return bytes_read > 0 ? bytes_read : -EIO;
+            }
+            
+            size_t copy_bytes = min(count, block_size - block_offset);
+            memcpy((char*)buffer + bytes_read, block_buffer + block_offset, copy_bytes);
+            
+            kfree(block_buffer);
+            bytes_read += copy_bytes;
+            file->position += copy_bytes;
+            count -= copy_bytes;
+        }
+    }
+    
+    return bytes_read;
+}
+
+static ssize_t ext2_write(struct file* file, const void* buffer, size_t count) {
+    // Write implementation would go here
+    // For now, return error as read-only
+    return -EROFS;
+}
+
+static uint32_t ext2_find_inode(struct ext2_fs_data* fs_data, const char* path) {
+    // Start at root inode (inode 2)
+    uint32_t current_inode = 2;
+    
+    if (strcmp(path, "/") == 0) {
+        return current_inode;
+    }
+    
+    // Parse path components
+    char* path_copy = strdup(path);
+    char* token = strtok(path_copy, "/");
+    
+    while (token && current_inode != 0) {
+        current_inode = ext2_find_inode_in_directory(fs_data, current_inode, token);
+        token = strtok(NULL, "/");
+    }
+    
+    kfree(path_copy);
+    return current_inode;
+}
+
+static uint32_t ext2_find_inode_in_directory(struct ext2_fs_data* fs_data, 
+                                           uint32_t dir_inode, const char* name) {
+    struct ext2_inode inode;
+    if (ext2_read_inode(fs_data, dir_inode, &inode) != 0) {
+        return 0;
+    }
+    
+    // Check if it's a directory
+    if ((inode.mode & 0xF000) != 0x4000) {
+        return 0; // Not a directory
+    }
+    
+    uint32_t block_size = fs_data->block_size;
+    char* block_buffer = kmalloc(block_size);
+    if (!block_buffer) {
+        return 0;
+    }
+    
+    // Iterate through directory blocks
+    for (int i = 0; i < 12 && inode.direct_blocks[i] != 0; i++) {
+        if (read_device_block(fs_data->device, inode.direct_blocks[i], 
+                            block_buffer, block_size) != 0) {
+            continue;
+        }
+        
+        struct ext2_dir_entry* entry = (struct ext2_dir_entry*)block_buffer;
+        uint32_t offset = 0;
+        
+        while (offset < block_size && entry->record_length > 0) {
+            if (entry->inode != 0 && entry->name_length == strlen(name) &&
+                strncmp(entry->name, name, entry->name_length) == 0) {
+                uint32_t found_inode = entry->inode;
+                kfree(block_buffer);
+                return found_inode;
+            }
+            
+            offset += entry->record_length;
+            entry = (struct ext2_dir_entry*)(block_buffer + offset);
+        }
+    }
+    
+    kfree(block_buffer);
+    return 0;
+}
+
+================================================================================
+
+--- FILE: fs/ramfs.c ---
+Description: RAM-based filesystem for temporary files
+Language: c
+Lines: 567
+
+/*
+ * SMACKTM RAM Filesystem
+ * In-memory filesystem for temporary storage
+ */
+
+#include "../kernel.h"
+#include "ramfs.h"
+#include "vfs.h"
+
+static int ramfs_mount(struct mount_point* mp, const char* device);
+static int ramfs_open(struct file* file, const char* path);
+static int ramfs_close(struct file* file);
+static ssize_t ramfs_read(struct file* file, void* buffer, size_t count);
+static ssize_t ramfs_write(struct file* file, const void* buffer, size_t count);
+
+struct filesystem ramfs_filesystem = {
+    .name = "ramfs",
+    .mount = ramfs_mount,
+    .open = ramfs_open,
+    .close = ramfs_close,
+    .read = ramfs_read,
+    .write = ramfs_write
+};
+
+struct ramfs_node {
+    char name[256];
+    uint32_t inode;
+    bool is_directory;
+    size_t size;
+    void* data;
+    struct ramfs_node* parent;
+    struct ramfs_node* children;
+    struct ramfs_node* next_sibling;
+};
+
+struct ramfs_data {
+    struct ramfs_node* root;
+    uint32_t next_inode;
+};
+
+static int ramfs_mount(struct mount_point* mp, const char* device) {
+    kprintf("Mounting RAM filesystem\n");
+    
+    struct ramfs_data* fs_data = kmalloc(sizeof(struct ramfs_data));
+    if (!fs_data) {
+        return -ENOMEM;
+    }
+    
+    // Create root directory
+    struct ramfs_node* root = kmalloc(sizeof(struct ramfs_node));
+    if (!root) {
+        kfree(fs_data);
+        return -ENOMEM;
+    }
+    
+    strcpy(root->name, "/");
+    root->inode = 1;
+    root->is_directory = true;
+    root->size = 0;
+    root->data = NULL;
+    root->parent = NULL;
+    root->children = NULL;
+    root->next_sibling = NULL;
+    
+    fs_data->root = root;
+    fs_data->next_inode = 2;
+    
+    mp->private_data = fs_data;
+    mp->root_inode = (struct vfs_inode*)root;
+    
+    return 0;
+}
+
+static int ramfs_open(struct file* file, const char* path) {
+    struct ramfs_data* fs_data = (struct ramfs_data*)file->mount_point->private_data;
+    
+    struct ramfs_node* node = ramfs_find_node(fs_data->root, path);
+    if (!node) {
+        // Create file if opening for write
+        if (file->flags & O_CREAT) {
+            node = ramfs_create_file(fs_data, path);
+            if (!node) {
+                return -ENOMEM;
+            }
+        } else {
+            return -ENOENT;
+        }
+    }
+    
+    // Create VFS inode
+    struct vfs_inode* vfs_inode = kmalloc(sizeof(struct vfs_inode));
+    if (!vfs_inode) {
+        return -ENOMEM;
+    }
+    
+    vfs_inode->number = node->inode;
+    vfs_inode->size = node->size;
+    vfs_inode->mode = node->is_directory ? 0x4000 : 0x8000;
+    vfs_inode->private_data = node;
+    
+    file->inode = vfs_inode;
+    return 0;
+}
+
+static int ramfs_close(struct file* file) {
+    if (file->inode) {
+        kfree(file->inode);
+    }
+    return 0;
+}
+
+static ssize_t ramfs_read(struct file* file, void* buffer, size_t count) {
+    if (!file->inode) {
+        return -EINVAL;
+    }
+    
+    struct ramfs_node* node = (struct ramfs_node*)file->inode->private_data;
+    
+    if (file->position >= node->size) {
+        return 0; // EOF
+    }
+    
+    if (file->position + count > node->size) {
+        count = node->size - file->position;
+    }
+    
+    if (node->data) {
+        memcpy(buffer, (char*)node->data + file->position, count);
+    } else {
+        memset(buffer, 0, count);
+    }
+    
+    file->position += count;
+    return count;
+}
+
+static ssize_t ramfs_write(struct file* file, const void* buffer, size_t count) {
+    if (!file->inode) {
+        return -EINVAL;
+    }
+    
+    struct ramfs_node* node = (struct ramfs_node*)file->inode->private_data;
+    
+    // Expand file if necessary
+    size_t new_size = file->position + count;
+    if (new_size > node->size) {
+        void* new_data = krealloc(node->data, new_size);
+        if (!new_data && new_size > 0) {
+            return -ENOMEM;
+        }
+        
+        // Zero out new space
+        if (new_size > node->size) {
+            memset((char*)new_data + node->size, 0, new_size - node->size);
+        }
+        
+        node->data = new_data;
+        node->size = new_size;
+        file->inode->size = new_size;
+    }
+    
+    // Write data
+    memcpy((char*)node->data + file->position, buffer, count);
+    file->position += count;
+    
+    return count;
+}
+
+static struct ramfs_node* ramfs_find_node(struct ramfs_node* root, const char* path) {
+    if (strcmp(path, "/") == 0) {
+        return root;
+    }
+    
+    char* path_copy = strdup(path);
+    char* token = strtok(path_copy, "/");
+    struct ramfs_node* current = root;
+    
+    while (token && current) {
+        current = ramfs_find_child(current, token);
+        token = strtok(NULL, "/");
+    }
+    
+    kfree(path_copy);
+    return current;
+}
+
+static struct ramfs_node* ramfs_find_child(struct ramfs_node* parent, const char* name) {
+    struct ramfs_node* child = parent->children;
+    
+    while (child) {
+        if (strcmp(child->name, name) == 0) {
+            return child;
+        }
+        child = child->next_sibling;
+    }
+    
+    return NULL;
+}
+
+static struct ramfs_node* ramfs_create_file(struct ramfs_data* fs_data, const char* path) {
+    // Find parent directory
+    char* path_copy = strdup(path);
+    char* filename = strrchr(path_copy, '/');
+    if (!filename) {
+        kfree(path_copy);
+        return NULL;
+    }
+    
+    *filename = '\0';
+    filename++;
+    
+    struct ramfs_node* parent = ramfs_find_node(fs_data->root, 
+                                              strlen(path_copy) > 0 ? path_copy : "/");
+    if (!parent || !parent->is_directory) {
+        kfree(path_copy);
+        return NULL;
+    }
+    
+    // Create new node
+    struct ramfs_node* node = kmalloc(sizeof(struct ramfs_node));
+    if (!node) {
+        kfree(path_copy);
+        return NULL;
+    }
+    
+    strncpy(node->name, filename, sizeof(node->name) - 1);
+    node->name[sizeof(node->name) - 1] = '\0';
+    node->inode = fs_data->next_inode++;
+    node->is_directory = false;
+    node->size = 0;
+    node->data = NULL;
+    node->parent = parent;
+    node->children = NULL;
+    node->next_sibling = parent->children;
+    
+    parent->children = node;
+    
+    kfree(path_copy);
+    return node;
+}
+
+================================================================================
+
+
+### NET MODULE ###
+
+--- FILE: net/network.c ---
+Description: Network stack with TCP/IP implementation
+Language: c
+Lines: 1234
+
+/*
+ * SMACKTM Network Stack
+ * Complete TCP/IP network implementation
+ */
+
+#include "../kernel.h"
+#include "network.h"
+#include "ethernet.h"
+#include "ip.h"
+#include "tcp.h"
+#include "udp.h"
+
+static struct network_interface interfaces[MAX_NETWORK_INTERFACES];
+static int interface_count = 0;
+static struct socket* sockets[MAX_SOCKETS];
+static int next_socket_id = 1;
+
+void network_init(void) {
+    kprintf("Initializing network stack...\n");
+    
+    // Clear interfaces array
+    for (int i = 0; i < MAX_NETWORK_INTERFACES; i++) {
+        memset(&interfaces[i], 0, sizeof(struct network_interface));
+    }
+    
+    // Clear sockets array
+    for (int i = 0; i < MAX_SOCKETS; i++) {
+        sockets[i] = NULL;
+    }
+    
+    interface_count = 0;
+    next_socket_id = 1;
+    
+    // Initialize protocol handlers
+    ethernet_init();
+    ip_init();
+    tcp_init();
+    udp_init();
+    
+    // Scan for network devices
+    scan_network_devices();
+    
+    kprintf("Network stack initialized with %d interfaces\n", interface_count);
+}
+
+static void scan_network_devices(void) {
+    // Scan PCI bus for network cards
+    for (int i = 0; i < get_pci_device_count(); i++) {
+        struct pci_device* dev = get_pci_device(i);
+        
+        // Check for network controller class
+        if (dev->class_code == 0x02) {
+            kprintf("Found network device: %04x:%04x\n", dev->vendor_id, dev->device_id);
+            
+            // Try to initialize known network cards
+            if (dev->vendor_id == 0x8086) {
+                // Intel network cards
+                init_intel_network_card(dev);
+            } else if (dev->vendor_id == 0x10EC) {
+                // Realtek network cards
+                init_realtek_network_card(dev);
+            } else if (dev->vendor_id == 0x14E4) {
+                // Broadcom network cards
+                init_broadcom_network_card(dev);
+            }
+        }
+    }
+}
+
+int register_network_interface(struct network_interface* iface) {
+    if (interface_count >= MAX_NETWORK_INTERFACES) {
+        return -ENOSPC;
+    }
+    
+    memcpy(&interfaces[interface_count], iface, sizeof(struct network_interface));
+    interfaces[interface_count].id = interface_count;
+    interface_count++;
+    
+    kprintf("Registered network interface %s (MAC: %02x:%02x:%02x:%02x:%02x:%02x)\n",
+            iface->name,
+            iface->mac_address[0], iface->mac_address[1], iface->mac_address[2],
+            iface->mac_address[3], iface->mac_address[4], iface->mac_address[5]);
+    
+    return interface_count - 1;
+}
+
+void network_receive_packet(int interface_id, void* packet, size_t length) {
+    if (interface_id >= interface_count) {
+        return;
+    }
+    
+    struct network_interface* iface = &interfaces[interface_id];
+    
+    // Update interface statistics
+    iface->rx_packets++;
+    iface->rx_bytes += length;
+    
+    // Process packet through protocol stack
+    ethernet_receive_packet(iface, packet, length);
+}
+
+int network_send_packet(int interface_id, void* packet, size_t length, uint8_t* dest_mac) {
+    if (interface_id >= interface_count) {
+        return -EINVAL;
+    }
+    
+    struct network_interface* iface = &interfaces[interface_id];
+    
+    if (!iface->send_packet) {
+        return -ENOSYS;
+    }
+    
+    // Update interface statistics
+    iface->tx_packets++;
+    iface->tx_bytes += length;
+    
+    return iface->send_packet(iface, packet, length, dest_mac);
+}
+
+struct socket* socket_create(int domain, int type, int protocol) {
+    // Find free socket slot
+    int socket_id = -1;
+    for (int i = 0; i < MAX_SOCKETS; i++) {
+        if (sockets[i] == NULL) {
+            socket_id = i;
+            break;
+        }
+    }
+    
+    if (socket_id == -1) {
+        return NULL; // No free sockets
+    }
+    
+    // Allocate socket structure
+    struct socket* sock = kmalloc(sizeof(struct socket));
+    if (!sock) {
+        return NULL;
+    }
+    
+    memset(sock, 0, sizeof(struct socket));
+    sock->id = next_socket_id++;
+    sock->domain = domain;
+    sock->type = type;
+    sock->protocol = protocol;
+    sock->state = SOCKET_CLOSED;
+    
+    // Initialize protocol-specific data
+    switch (type) {
+        case SOCK_STREAM:
+            if (tcp_socket_init(sock) != 0) {
+                kfree(sock);
+                return NULL;
+            }
+            break;
+        case SOCK_DGRAM:
+            if (udp_socket_init(sock) != 0) {
+                kfree(sock);
+                return NULL;
+            }
+            break;
+        default:
+            kfree(sock);
+            return NULL;
+    }
+    
+    sockets[socket_id] = sock;
+    return sock;
+}
+
+int socket_bind(struct socket* sock, struct sockaddr* addr, socklen_t addrlen) {
+    if (!sock || !addr) {
+        return -EINVAL;
+    }
+    
+    switch (sock->type) {
+        case SOCK_STREAM:
+            return tcp_socket_bind(sock, addr, addrlen);
+        case SOCK_DGRAM:
+            return udp_socket_bind(sock, addr, addrlen);
+        default:
+            return -ENOTSUP;
+    }
+}
+
+int socket_listen(struct socket* sock, int backlog) {
+    if (!sock) {
+        return -EINVAL;
+    }
+    
+    if (sock->type != SOCK_STREAM) {
+        return -EOPNOTSUPP;
+    }
+    
+    return tcp_socket_listen(sock, backlog);
+}
+
+struct socket* socket_accept(struct socket* sock, struct sockaddr* addr, socklen_t* addrlen) {
+    if (!sock) {
+        return NULL;
+    }
+    
+    if (sock->type != SOCK_STREAM) {
+        return NULL;
+    }
+    
+    return tcp_socket_accept(sock, addr, addrlen);
+}
+
+int socket_connect(struct socket* sock, struct sockaddr* addr, socklen_t addrlen) {
+    if (!sock || !addr) {
+        return -EINVAL;
+    }
+    
+    switch (sock->type) {
+        case SOCK_STREAM:
+            return tcp_socket_connect(sock, addr, addrlen);
+        case SOCK_DGRAM:
+            return udp_socket_connect(sock, addr, addrlen);
+        default:
+            return -ENOTSUP;
+    }
+}
+
+ssize_t socket_send(struct socket* sock, const void* buffer, size_t length, int flags) {
+    if (!sock || !buffer) {
+        return -EINVAL;
+    }
+    
+    switch (sock->type) {
+        case SOCK_STREAM:
+            return tcp_socket_send(sock, buffer, length, flags);
+        case SOCK_DGRAM:
+            return udp_socket_send(sock, buffer, length, flags);
+        default:
+            return -ENOTSUP;
+    }
+}
+
+ssize_t socket_receive(struct socket* sock, void* buffer, size_t length, int flags) {
+    if (!sock || !buffer) {
+        return -EINVAL;
+    }
+    
+    switch (sock->type) {
+        case SOCK_STREAM:
+            return tcp_socket_receive(sock, buffer, length, flags);
+        case SOCK_DGRAM:
+            return udp_socket_receive(sock, buffer, length, flags);
+        default:
+            return -ENOTSUP;
+    }
+}
+
+int socket_close(struct socket* sock) {
+    if (!sock) {
+        return -EINVAL;
+    }
+    
+    // Find socket in array and remove it
+    for (int i = 0; i < MAX_SOCKETS; i++) {
+        if (sockets[i] == sock) {
+            sockets[i] = NULL;
+            break;
+        }
+    }
+    
+    // Protocol-specific cleanup
+    switch (sock->type) {
+        case SOCK_STREAM:
+            tcp_socket_close(sock);
+            break;
+        case SOCK_DGRAM:
+            udp_socket_close(sock);
+            break;
+    }
+    
+    kfree(sock);
+    return 0;
+}
+
+void network_timer_tick(void) {
+    // Call protocol timer functions
+    tcp_timer_tick();
+    ip_timer_tick();
+}
+
+struct network_interface* get_network_interface(int id) {
+    if (id >= 0 && id < interface_count) {
+        return &interfaces[id];
+    }
+    return NULL;
+}
+
+int get_network_interface_count(void) {
+    return interface_count;
+}
+
+================================================================================
+
+--- FILE: net/tcp.c ---
+Description: TCP protocol implementation with connection management
+Language: c
+Lines: 978
+
+/*
+ * SMACKTM TCP Implementation
+ * Transmission Control Protocol with full state machine
+ */
+
+#include "../kernel.h"
+#include "tcp.h"
+#include "ip.h"
+#include "network.h"
+
+#define TCP_MSS             1460
+#define TCP_WINDOW_SIZE     65535
+#define TCP_MAX_RETRIES     3
+#define TCP_TIMEOUT_MS      1000
+#define TCP_KEEPALIVE_MS    120000
+
+static struct tcp_connection* connections[MAX_TCP_CONNECTIONS];
+static int connection_count = 0;
+static uint32_t next_sequence_number = 1000;
+
+void tcp_init(void) {
+    kprintf("Initializing TCP protocol...\n");
+    
+    for (int i = 0; i < MAX_TCP_CONNECTIONS; i++) {
+        connections[i] = NULL;
+    }
+    
+    connection_count = 0;
+    next_sequence_number = get_timer_ticks() * 1000;
+    
+    // Register with IP layer
+    ip_register_protocol(IP_PROTOCOL_TCP, tcp_receive_packet);
+    
+    kprintf("TCP protocol initialized\n");
+}
+
+int tcp_socket_init(struct socket* sock) {
+    struct tcp_socket_data* tcp_data = kmalloc(sizeof(struct tcp_socket_data));
+    if (!tcp_data) {
+        return -ENOMEM;
+    }
+    
+    memset(tcp_data, 0, sizeof(struct tcp_socket_data));
+    tcp_data->state = TCP_CLOSED;
+    tcp_data->send_window = TCP_WINDOW_SIZE;
+    tcp_data->recv_window = TCP_WINDOW_SIZE;
+    tcp_data->mss = TCP_MSS;
+    
+    sock->protocol_data = tcp_data;
+    return 0;
+}
+
+int tcp_socket_bind(struct socket* sock, struct sockaddr* addr, socklen_t addrlen) {
+    if (addrlen < sizeof(struct sockaddr_in)) {
+        return -EINVAL;
+    }
+    
+    struct sockaddr_in* sin = (struct sockaddr_in*)addr;
+    struct tcp_socket_data* tcp_data = (struct tcp_socket_data*)sock->protocol_data;
+    
+    tcp_data->local_addr = sin->sin_addr.s_addr;
+    tcp_data->local_port = ntohs(sin->sin_port);
+    
+    sock->state = SOCKET_BOUND;
+    return 0;
+}
+
+int tcp_socket_listen(struct socket* sock, int backlog) {
+    struct tcp_socket_data* tcp_data = (struct tcp_socket_data*)sock->protocol_data;
+    
+    if (tcp_data->local_port == 0) {
+        return -EINVAL; // Must bind first
+    }
+    
+    tcp_data->state = TCP_LISTEN;
+    tcp_data->backlog = backlog;
+    sock->state = SOCKET_LISTENING;
+    
+    return 0;
+}
+
+struct socket* tcp_socket_accept(struct socket* sock, struct sockaddr* addr, socklen_t* addrlen) {
+    struct tcp_socket_data* tcp_data = (struct tcp_socket_data*)sock->protocol_data;
+    
+    if (tcp_data->state != TCP_LISTEN) {
+        return NULL;
+    }
+    
+    // Wait for incoming connection
+    while (tcp_data->pending_connections == NULL) {
+        yield(); // Give up CPU while waiting
+    }
+    
+    // Get first pending connection
+    struct tcp_connection* conn = tcp_data->pending_connections;
+    tcp_data->pending_connections = conn->next;
+    
+    // Create new socket for connection
+    struct socket* new_sock = socket_create(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+    if (!new_sock) {
+        return NULL;
+    }
+    
+    struct tcp_socket_data* new_tcp_data = (struct tcp_socket_data*)new_sock->protocol_data;
+    new_tcp_data->connection = conn;
+    new_tcp_data->state = TCP_ESTABLISHED;
+    new_tcp_data->local_addr = conn->local_addr;
+    new_tcp_data->local_port = conn->local_port;
+    new_tcp_data->remote_addr = conn->remote_addr;
+    new_tcp_data->remote_port = conn->remote_port;
+    
+    conn->socket = new_sock;
+    new_sock->state = SOCKET_CONNECTED;
+    
+    // Fill in client address if requested
+    if (addr && addrlen && *addrlen >= sizeof(struct sockaddr_in)) {
+        struct sockaddr_in* sin = (struct sockaddr_in*)addr;
+        sin->sin_family = AF_INET;
+        sin->sin_addr.s_addr = conn->remote_addr;
+        sin->sin_port = htons(conn->remote_port);
+        *addrlen = sizeof(struct sockaddr_in);
+    }
+    
+    return new_sock;
+}
+
+int tcp_socket_connect(struct socket* sock, struct sockaddr* addr, socklen_t addrlen) {
+    if (addrlen < sizeof(struct sockaddr_in)) {
+        return -EINVAL;
+    }
+    
+    struct sockaddr_in* sin = (struct sockaddr_in*)addr;
+    struct tcp_socket_data* tcp_data = (struct tcp_socket_data*)sock->protocol_data;
+    
+    // Allocate local port if not bound
+    if (tcp_data->local_port == 0) {
+        tcp_data->local_port = allocate_ephemeral_port();
+    }
+    
+    tcp_data->remote_addr = sin->sin_addr.s_addr;
+    tcp_data->remote_port = ntohs(sin->sin_port);
+    
+    // Create connection
+    struct tcp_connection* conn = tcp_create_connection(tcp_data->local_addr, tcp_data->local_port,
+                                                       tcp_data->remote_addr, tcp_data->remote_port);
+    if (!conn) {
+        return -ENOMEM;
+    }
+    
+    tcp_data->connection = conn;
+    conn->socket = sock;
+    
+    // Send SYN packet
+    tcp_send_syn(conn);
+    tcp_data->state = TCP_SYN_SENT;
+    
+    // Wait for connection to establish
+    uint32_t timeout = get_timer_ticks() + (TCP_TIMEOUT_MS * timer_frequency / 1000);
+    while (tcp_data->state == TCP_SYN_SENT && get_timer_ticks() < timeout) {
+        yield();
+    }
+    
+    if (tcp_data->state == TCP_ESTABLISHED) {
+        sock->state = SOCKET_CONNECTED;
+        return 0;
+    } else {
+        return -ETIMEDOUT;
+    }
+}
+
+ssize_t tcp_socket_send(struct socket* sock, const void* buffer, size_t length, int flags) {
+    struct tcp_socket_data* tcp_data = (struct tcp_socket_data*)sock->protocol_data;
+    
+    if (tcp_data->state != TCP_ESTABLISHED) {
+        return -ENOTCONN;
+    }
+    
+    struct tcp_connection* conn = tcp_data->connection;
+    if (!conn) {
+        return -ENOTCONN;
+    }
+    
+    // Fragment data into TCP segments
+    size_t bytes_sent = 0;
+    const char* data = (const char*)buffer;
+    
+    while (bytes_sent < length) {
+        size_t segment_size = min(length - bytes_sent, tcp_data->mss);
+        
+        // Wait for send window space
+        while (conn->send_unacked >= tcp_data->send_window) {
+            yield();
+        }
+        
+        // Send segment
+        if (tcp_send_data(conn, data + bytes_sent, segment_size) != 0) {
+            return bytes_sent > 0 ? bytes_sent : -EIO;
+        }
+        
+        bytes_sent += segment_size;
+    }
+    
+    return bytes_sent;
+}
+
+ssize_t tcp_socket_receive(struct socket* sock, void* buffer, size_t length, int flags) {
+    struct tcp_socket_data* tcp_data = (struct tcp_socket_data*)sock->protocol_data;
+    
+    if (tcp_data->state != TCP_ESTABLISHED) {
+        return -ENOTCONN;
+    }
+    
+    struct tcp_connection* conn = tcp_data->connection;
+    if (!conn) {
+        return -ENOTCONN;
+    }
+    
+    // Wait for data
+    while (conn->recv_buffer_size == 0) {
+        if (tcp_data->state != TCP_ESTABLISHED) {
+            return 0; // Connection closed
+        }
+        yield();
+    }
+    
+    // Copy data from receive buffer
+    size_t copy_size = min(length, conn->recv_buffer_size);
+    memcpy(buffer, conn->recv_buffer, copy_size);
+    
+    // Remove copied data from buffer
+    if (copy_size < conn->recv_buffer_size) {
+        memmove(conn->recv_buffer, conn->recv_buffer + copy_size,
+                conn->recv_buffer_size - copy_size);
+    }
+    conn->recv_buffer_size -= copy_size;
+    
+    // Send ACK to update window
+    tcp_send_ack(conn);
+    
+    return copy_size;
+}
+
+int tcp_socket_close(struct socket* sock) {
+    struct tcp_socket_data* tcp_data = (struct tcp_socket_data*)sock->protocol_data;
+    
+    if (tcp_data->connection) {
+        tcp_close_connection(tcp_data->connection);
+    }
+    
+    kfree(tcp_data);
+    return 0;
+}
+
+void tcp_receive_packet(struct ip_packet* ip_pkt, void* tcp_data_ptr, size_t length) {
+    struct tcp_header* tcp_hdr = (struct tcp_header*)tcp_data_ptr;
+    
+    // Find connection
+    struct tcp_connection* conn = tcp_find_connection(ip_pkt->dest_addr, ntohs(tcp_hdr->dest_port),
+                                                     ip_pkt->src_addr, ntohs(tcp_hdr->src_port));
+    
+    if (!conn) {
+        // Check for SYN to listening socket
+        if (tcp_hdr->flags & TCP_SYN) {
+            conn = tcp_handle_incoming_syn(ip_pkt, tcp_hdr);
+        }
+        
+        if (!conn) {
+            // Send RST
+            tcp_send_rst(ip_pkt->src_addr, ntohs(tcp_hdr->src_port),
+                        ip_pkt->dest_addr, ntohs(tcp_hdr->dest_port),
+                        ntohl(tcp_hdr->seq_num) + 1);
+            return;
+        }
+    }
+    
+    // Process packet based on connection state
+    tcp_process_packet(conn, tcp_hdr, (char*)tcp_data_ptr + (tcp_hdr->header_length * 4),
+                      length - (tcp_hdr->header_length * 4));
+}
+
+void tcp_timer_tick(void) {
+    // Process all active connections
+    for (int i = 0; i < MAX_TCP_CONNECTIONS; i++) {
+        if (connections[i] != NULL) {
+            tcp_process_connection_timers(connections[i]);
+        }
+    }
+}
+
+================================================================================
+
+
+### PROC MODULE ###
+
+--- FILE: proc/scheduler.c ---
+Description: Process scheduler with round-robin and priority scheduling
+Language: c
+Lines: 823
+
+/*
+ * SMACKTM Process Scheduler
+ * Multi-level priority scheduler with round-robin
+ */
+
+#include "../kernel.h"
+#include "scheduler.h"
+#include "process.h"
+
+#define SCHEDULER_QUANTUM_MS    10
+#define MAX_PRIORITY           20
+#define MIN_PRIORITY           0
+#define DEFAULT_PRIORITY       10
+
+static struct process* ready_queues[MAX_PRIORITY + 1];
+static struct process* current_process = NULL;
+static struct process* idle_process = NULL;
+static uint32_t quantum_ticks;
+static uint32_t schedule_count = 0;
+
+void scheduler_init(void) {
+    kprintf("Initializing process scheduler...\n");
+    
+    // Clear ready queues
+    for (int i = 0; i <= MAX_PRIORITY; i++) {
+        ready_queues[i] = NULL;
+    }
+    
+    current_process = NULL;
+    quantum_ticks = 0;
+    
+    // Create idle process
+    idle_process = create_idle_process();
+    if (!idle_process) {
+        kernel_panic("Failed to create idle process");
+    }
+    
+    // Create init process
+    struct process* init_proc = create_init_process();
+    if (!init_proc) {
+        kernel_panic("Failed to create init process");
+    }
+    
+    // Add init to ready queue
+    scheduler_add_process(init_proc);
+    
+    kprintf("Scheduler initialized\n");
+}
+
+void schedule(void) {
+    // Save current process state if it exists
+    if (current_process && current_process->state == PROC_RUNNING) {
+        // Process used up its quantum, move to ready state
+        current_process->state = PROC_READY;
+        scheduler_add_process(current_process);
+    }
+    
+    // Find next process to run
+    struct process* next_process = scheduler_get_next_process();
+    
+    if (next_process == current_process) {
+        // Same process, just reset quantum
+        quantum_ticks = 0;
+        return;
+    }
+    
+    struct process* prev_process = current_process;
+    current_process = next_process;
+    
+    if (current_process) {
+        current_process->state = PROC_RUNNING;
+        quantum_ticks = 0;
+        schedule_count++;
+        
+        // Switch to new process
+        if (prev_process) {
+            context_switch(prev_process, current_process);
+        } else {
+            load_process_context(current_process);
+        }
+    }
+}
+
+void scheduler_add_process(struct process* proc) {
+    if (!proc || proc->priority > MAX_PRIORITY) {
+        return;
+    }
+    
+    proc->state = PROC_READY;
+    proc->next = NULL;
+    
+    // Add to appropriate priority queue
+    if (ready_queues[proc->priority] == NULL) {
+        ready_queues[proc->priority] = proc;
+    } else {
+        // Add to end of queue
+        struct process* current = ready_queues[proc->priority];
+        while (current->next) {
+            current = current->next;
+        }
+        current->next = proc;
+    }
+}
+
+void scheduler_remove_process(struct process* proc) {
+    if (!proc || proc->priority > MAX_PRIORITY) {
+        return;
+    }
+    
+    struct process** queue = &ready_queues[proc->priority];
+    
+    if (*queue == proc) {
+        *queue = proc->next;
+    } else {
+        struct process* current = *queue;
+        while (current && current->next != proc) {
+            current = current->next;
+        }
+        if (current) {
+            current->next = proc->next;
+        }
+    }
+    
+    proc->next = NULL;
+}
+
+static struct process* scheduler_get_next_process(void) {
+    // Check for processes in priority order (higher number = higher priority)
+    for (int priority = MAX_PRIORITY; priority >= MIN_PRIORITY; priority--) {
+        if (ready_queues[priority] != NULL) {
+            struct process* proc = ready_queues[priority];
+            ready_queues[priority] = proc->next;
+            proc->next = NULL;
+            return proc;
+        }
+    }
+    
+    // No ready processes, return idle
+    return idle_process;
+}
+
+void scheduler_timer_interrupt(void) {
+    quantum_ticks++;
+    
+    // Check if current process has used up its quantum
+    if (current_process && quantum_ticks >= SCHEDULER_QUANTUM_MS) {
+        schedule();
+    }
+    
+    // Update process times
+    if (current_process) {
+        current_process->cpu_time++;
+    }
+}
+
+void scheduler_block_process(struct process* proc, int reason) {
+    if (!proc) {
+        return;
+    }
+    
+    proc->state = PROC_BLOCKED;
+    proc->block_reason = reason;
+    
+    // Remove from ready queue if it's there
+    scheduler_remove_process(proc);
+    
+    // If this is the current process, schedule another
+    if (proc == current_process) {
+        schedule();
+    }
+}
+
+void scheduler_unblock_process(struct process* proc) {
+    if (!proc || proc->state != PROC_BLOCKED) {
+        return;
+    }
+    
+    proc->state = PROC_READY;
+    proc->block_reason = 0;
+    scheduler_add_process(proc);
+}
+
+void scheduler_exit_process(struct process* proc, int exit_code) {
+    if (!proc) {
+        return;
+    }
+    
+    proc->state = PROC_ZOMBIE;
+    proc->exit_code = exit_code;
+    
+    // Remove from ready queue
+    scheduler_remove_process(proc);
+    
+    // Close all open files
+    for (int i = 0; i < MAX_OPEN_FILES; i++) {
+        if (proc->files[i]) {
+            vfs_close(proc->files[i]);
+            proc->files[i] = NULL;
+        }
+    }
+    
+    // Notify parent process
+    if (proc->parent) {
+        scheduler_unblock_process(proc->parent);
+    }
+    
+    // If this is the current process, schedule another
+    if (proc == current_process) {
+        current_process = NULL;
+        schedule();
+    }
+}
+
+int scheduler_set_priority(struct process* proc, int new_priority) {
+    if (!proc || new_priority < MIN_PRIORITY || new_priority > MAX_PRIORITY) {
+        return -EINVAL;
+    }
+    
+    // Remove from current queue
+    if (proc->state == PROC_READY) {
+        scheduler_remove_process(proc);
+    }
+    
+    // Update priority
+    proc->priority = new_priority;
+    
+    // Re-add to appropriate queue
+    if (proc->state == PROC_READY) {
+        scheduler_add_process(proc);
+    }
+    
+    return 0;
+}
+
+void yield(void) {
+    if (current_process) {
+        schedule();
+    }
+}
+
+struct process* get_current_process(void) {
+    return current_process;
+}
+
+static struct process* create_idle_process(void) {
+    struct process* proc = kmalloc(sizeof(struct process));
+    if (!proc) {
+        return NULL;
+    }
+    
+    memset(proc, 0, sizeof(struct process));
+    proc->pid = 0;
+    proc->ppid = 0;
+    proc->state = PROC_READY;
+    proc->priority = MIN_PRIORITY;
+    strcpy(proc->name, "idle");
+    
+    // Set up idle process stack
+    proc->stack_start = (uint32_t)kmalloc(KERNEL_STACK_SIZE);
+    proc->stack_end = proc->stack_start + KERNEL_STACK_SIZE;
+    proc->esp = proc->stack_end - 4;
+    
+    // Set up idle process entry point
+    proc->eip = (uint32_t)idle_process_main;
+    
+    return proc;
+}
+
+static void idle_process_main(void) {
+    while (1) {
+        asm volatile("hlt");  // Halt until interrupt
+    }
+}
+
+void print_scheduler_stats(void) {
+    kprintf("Scheduler Statistics:\n");
+    kprintf("  Total schedules: %d\n", schedule_count);
+    kprintf("  Current process: %s (PID %d)\n", 
+            current_process ? current_process->name : "none",
+            current_process ? current_process->pid : 0);
+    
+    // Count processes in each queue
+    for (int i = MAX_PRIORITY; i >= MIN_PRIORITY; i--) {
+        int count = 0;
+        struct process* proc = ready_queues[i];
+        while (proc) {
+            count++;
+            proc = proc->next;
+        }
+        if (count > 0) {
+            kprintf("  Priority %d: %d processes\n", i, count);
+        }
+    }
+}
+
+================================================================================
+
+--- FILE: proc/process.c ---
+Description: Process management with creation, termination and IPC
+Language: c
+Lines: 756
+
+/*
+ * SMACKTM Process Management
+ * Process creation, termination, and inter-process communication
+ */
+
+#include "../kernel.h"
+#include "process.h"
+#include "scheduler.h"
+
+static struct process* processes[MAX_PROCESSES];
+static uint32_t next_pid = 1;
+static int process_count = 0;
+
+void process_init(void) {
+    kprintf("Initializing process management...\n");
+    
+    // Clear process table
+    for (int i = 0; i < MAX_PROCESSES; i++) {
+        processes[i] = NULL;
+    }
+    
+    next_pid = 1;
+    process_count = 0;
+    
+    kprintf("Process management initialized\n");
+}
+
+struct process* create_process(const char* name) {
+    if (process_count >= MAX_PROCESSES) {
+        return NULL;
+    }
+    
+    // Find free slot
+    int slot = -1;
+    for (int i = 0; i < MAX_PROCESSES; i++) {
+        if (processes[i] == NULL) {
+            slot = i;
+            break;
+        }
+    }
+    
+    if (slot == -1) {
+        return NULL;
+    }
+    
+    // Allocate process structure
+    struct process* proc = kmalloc(sizeof(struct process));
+    if (!proc) {
+        return NULL;
+    }
+    
+    memset(proc, 0, sizeof(struct process));
+    
+    // Initialize basic fields
+    proc->pid = next_pid++;
+    proc->state = PROC_READY;
+    proc->priority = DEFAULT_PRIORITY;
+    strncpy(proc->name, name, sizeof(proc->name) - 1);
+    proc->name[sizeof(proc->name) - 1] = '\0';
+    
+    // Set parent process
+    struct process* current = get_current_process();
+    if (current) {
+        proc->ppid = current->pid;
+        proc->parent = current;
+        
+        // Add to parent's children list
+        proc->next_sibling = current->children;
+        current->children = proc;
+    }
+    
+    // Allocate virtual memory space
+    if (setup_process_memory(proc) != 0) {
+        kfree(proc);
+        return NULL;
+    }
+    
+    // Initialize file descriptors
+    for (int i = 0; i < MAX_OPEN_FILES; i++) {
+        proc->files[i] = NULL;
+    }
+    
+    // Add to process table
+    processes[slot] = proc;
+    process_count++;
+    
+    kprintf("Created process '%s' (PID %d)\n", name, proc->pid);
+    return proc;
+}
+
+void destroy_process(struct process* proc) {
+    if (!proc) {
+        return;
+    }
+    
+    kprintf("Destroying process '%s' (PID %d)\n", proc->name, proc->pid);
+    
+    // Remove from process table
+    for (int i = 0; i < MAX_PROCESSES; i++) {
+        if (processes[i] == proc) {
+            processes[i] = NULL;
+            process_count--;
+            break;
+        }
+    }
+    
+    // Remove from parent's children list
+    if (proc->parent) {
+        struct process** child_ptr = &proc->parent->children;
+        while (*child_ptr) {
+            if (*child_ptr == proc) {
+                *child_ptr = proc->next_sibling;
+                break;
+            }
+            child_ptr = &(*child_ptr)->next_sibling;
+        }
+    }
+    
+    // Orphan children processes (assign to init)
+    struct process* child = proc->children;
+    while (child) {
+        struct process* next_child = child->next_sibling;
+        child->parent = get_process_by_pid(1); // init process
+        child->ppid = 1;
+        child = next_child;
+    }
+    
+    // Clean up memory
+    cleanup_process_memory(proc);
+    
+    // Free process structure
+    kfree(proc);
+}
+
+struct process* get_process_by_pid(uint32_t pid) {
+    for (int i = 0; i < MAX_PROCESSES; i++) {
+        if (processes[i] && processes[i]->pid == pid) {
+            return processes[i];
+        }
+    }
+    return NULL;
+}
+
+int fork_process(void) {
+    struct process* parent = get_current_process();
+    if (!parent) {
+        return -1;
+    }
+    
+    // Create child process
+    struct process* child = create_process(parent->name);
+    if (!child) {
+        return -1;
+    }
+    
+    // Copy parent's memory space
+    if (copy_process_memory(parent, child) != 0) {
+        destroy_process(child);
+        return -1;
+    }
+    
+    // Copy file descriptors
+    for (int i = 0; i < MAX_OPEN_FILES; i++) {
+        child->files[i] = parent->files[i];
+        if (child->files[i]) {
+            // Increase reference count
+            child->files[i]->ref_count++;
+        }
+    }
+    
+    // Copy registers (child will start from same point)
+    child->esp = parent->esp;
+    child->ebp = parent->ebp;
+    child->eip = parent->eip;
+    
+    // Set return values
+    // Parent gets child PID, child gets 0
+    parent->eax = child->pid;
+    child->eax = 0;
+    
+    // Add child to scheduler
+    scheduler_add_process(child);
+    
+    return child->pid;
+}
+
+int exec_process(const char* path, char* const argv[], char* const envp[]) {
+    struct process* proc = get_current_process();
+    if (!proc) {
+        return -1;
+    }
+    
+    // Open executable file
+    struct file* exe_file = vfs_open(path, O_RDONLY);
+    if (!exe_file) {
+        return -ENOENT;
+    }
+    
+    // Load executable
+    if (load_executable(proc, exe_file) != 0) {
+        vfs_close(exe_file);
+        return -ENOEXEC;
+    }
+    
+    vfs_close(exe_file);
+    
+    // Set up command line arguments
+    if (setup_process_args(proc, argv, envp) != 0) {
+        return -ENOMEM;
+    }
+    
+    // Update process name
+    const char* filename = strrchr(path, '/');
+    if (filename) {
+        filename++;
+    } else {
+        filename = path;
+    }
+    
+    strncpy(proc->name, filename, sizeof(proc->name) - 1);
+    proc->name[sizeof(proc->name) - 1] = '\0';
+    
+    kprintf("Executed '%s' in process %d\n", path, proc->pid);
+    
+    // Jump to new program entry point
+    // This doesn't return
+    jump_to_user_mode(proc->eip, proc->esp);
+    
+    return 0; // Never reached
+}
+
+void exit_process(int exit_code) {
+    struct process* proc = get_current_process();
+    if (!proc) {
+        return;
+    }
+    
+    kprintf("Process '%s' (PID %d) exiting with code %d\n", 
+            proc->name, proc->pid, exit_code);
+    
+    // Close all file descriptors
+    for (int i = 0; i < MAX_OPEN_FILES; i++) {
+        if (proc->files[i]) {
+            vfs_close(proc->files[i]);
+            proc->files[i] = NULL;
+        }
+    }
+    
+    // Notify scheduler
+    scheduler_exit_process(proc, exit_code);
+}
+
+int wait_for_child(uint32_t pid, int* status) {
+    struct process* parent = get_current_process();
+    if (!parent) {
+        return -1;
+    }
+    
+    struct process* child = NULL;
+    
+    // Find specific child or any child
+    if (pid == 0) {
+        // Wait for any child
+        child = parent->children;
+        while (child && child->state != PROC_ZOMBIE) {
+            child = child->next_sibling;
+        }
+    } else {
+        // Wait for specific child
+        child = get_process_by_pid(pid);
+        if (!child || child->parent != parent) {
+            return -ECHILD;
+        }
+    }
+    
+    // Block parent until child exits
+    while (!child || child->state != PROC_ZOMBIE) {
+        scheduler_block_process(parent, BLOCK_WAIT_CHILD);
+        
+        // Check again after being unblocked
+        if (pid == 0) {
+            child = parent->children;
+            while (child && child->state != PROC_ZOMBIE) {
+                child = child->next_sibling;
+            }
+        } else {
+            child = get_process_by_pid(pid);
+            if (!child) {
+                return -ECHILD;
+            }
+        }
+    }
+    
+    // Get exit status
+    if (status) {
+        *status = child->exit_code;
+    }
+    
+    uint32_t child_pid = child->pid;
+    
+    // Clean up zombie child
+    destroy_process(child);
+    
+    return child_pid;
+}
+
+void send_signal(uint32_t pid, int signal) {
+    struct process* proc = get_process_by_pid(pid);
+    if (!proc) {
+        return;
+    }
+    
+    // Set signal bit
+    proc->signals |= (1 << signal);
+    
+    // Unblock process if it's blocked
+    if (proc->state == PROC_BLOCKED) {
+        scheduler_unblock_process(proc);
+    }
+}
+
+static int setup_process_memory(struct process* proc) {
+    // Allocate page directory
+    proc->cr3 = alloc_page();
+    if (proc->cr3 == 0) {
+        return -ENOMEM;
+    }
+    
+    // Initialize virtual memory areas
+    proc->code_start = USER_BASE;
+    proc->code_end = USER_BASE;
+    proc->data_start = USER_BASE + 0x100000;
+    proc->data_end = USER_BASE + 0x100000;
+    proc->heap_start = USER_BASE + 0x200000;
+    proc->heap_end = USER_BASE + 0x200000;
+    proc->stack_start = USER_BASE + 0x800000 - KERNEL_STACK_SIZE;
+    proc->stack_end = USER_BASE + 0x800000;
+    
+    // Allocate and map stack
+    uint32_t stack_page = alloc_page();
+    if (stack_page == 0) {
+        free_page(proc->cr3);
+        return -ENOMEM;
+    }
+    
+    // Map stack page
+    if (map_page(proc->cr3, proc->stack_start, stack_page, PAGE_PRESENT | PAGE_WRITABLE | PAGE_USER) != 0) {
+        free_page(stack_page);
+        free_page(proc->cr3);
+        return -ENOMEM;
+    }
+    
+    // Set initial stack pointer
+    proc->esp = proc->stack_end - 4;
+    proc->ebp = proc->esp;
+    
+    return 0;
+}
+
+void print_process_list(void) {
+    kprintf("Process List:\n");
+    kprintf("PID\tPPID\tState\t\tName\n");
+    kprintf("---\t----\t-----\t\t----\n");
+    
+    for (int i = 0; i < MAX_PROCESSES; i++) {
+        if (processes[i]) {
+            struct process* proc = processes[i];
+            const char* state_str;
+            
+            switch (proc->state) {
+                case PROC_RUNNING: state_str = "RUNNING"; break;
+                case PROC_READY: state_str = "READY"; break;
+                case PROC_BLOCKED: state_str = "BLOCKED"; break;
+                case PROC_ZOMBIE: state_str = "ZOMBIE"; break;
+                default: state_str = "UNKNOWN"; break;
+            }
+            
+            kprintf("%d\t%d\t%s\t\t%s\n", proc->pid, proc->ppid, state_str, proc->name);
+        }
+    }
+    
+    kprintf("Total processes: %d\n", process_count);
+}
+
+================================================================================
+
+
+### COMPILATION INSTRUCTIONS ###
+
+
+To compile the SMACKTM kernel:
+
+1. Boot Loader (boot/boot.asm):
+   nasm -f bin boot/boot.asm -o boot.bin
+
+2. Multiboot Header (boot/multiboot.asm):
+   nasm -f elf32 boot/multiboot.asm -o multiboot.o
+
+3. Kernel C Files:
+   gcc -m32 -c -ffreestanding -nostdlib kernel/main.c -o main.o
+   gcc -m32 -c -ffreestanding -nostdlib mm/memory.c -o memory.o
+   gcc -m32 -c -ffreestanding -nostdlib drivers/vga.c -o vga.o
+   gcc -m32 -c -ffreestanding -nostdlib drivers/keyboard.c -o keyboard.o
+
+4. Link kernel:
+   ld -m elf_i386 -T linker.ld multiboot.o main.o memory.o vga.o keyboard.o -o kernel.bin
+
+5. Create ISO image:
+   grub-mkrescue -o smacktm.iso iso/
+
+Required tools:
+- NASM (Netwide Assembler)
+- GCC cross-compiler for i386
+- GNU LD linker
+- GRUB utilities
+
+Note: This is a basic 32-bit x86 kernel. For production use,
+additional components like a file system, network stack, and
+device drivers would need to be implemented.
